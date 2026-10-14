@@ -1,0 +1,7 @@
+ultralytics
+opencv-python
+numpy
+tensorflow
+tf-keras
+pytesseract
+Pillow

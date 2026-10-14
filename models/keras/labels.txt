@@ -1,0 +1,2 @@
+0 thread breaked
+1 threat not breaked
