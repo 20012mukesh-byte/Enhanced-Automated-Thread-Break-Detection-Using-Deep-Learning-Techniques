@@ -1,3 +1,4 @@
+import re
 import time
 from pathlib import Path
 
@@ -12,14 +13,21 @@ CONFIDENCE = 0.40
 IMAGE_SIZE = 640
 
 
-def digit_from_class_name(class_name: str) -> str | None:
-    """Return a single digit if the class looks like 0-9."""
+def slot_digit_from_class_name(class_name: str) -> str | None:
+    """Return the numeric suffix from a YOLO class name.
+
+    Labels such as `slot_01`, `slot_1`, and `1` are all valid model outputs;
+    the detector should preserve the full numeric value from the class name,
+    including any leading zero used for slot numbering.
+    """
     name = class_name.strip().lower()
-    if name.isdigit() and len(name) == 1:
-        return name
-    for token in name.replace("-", " ").replace("_", " ").split():
-        if token.isdigit() and len(token) == 1:
-            return token
+    match = re.search(r"(\d+)", name)
+    if match is None:
+        return None
+
+    value = match.group(1)
+    if value.isdigit():
+        return value
     return None
 
 
@@ -29,7 +37,7 @@ def assemble_number(boxes, names) -> str:
     for box in boxes:
         class_id = int(box.cls[0])
         class_name = names[class_id]
-        digit = digit_from_class_name(class_name)
+        digit = slot_digit_from_class_name(class_name)
         if digit is None:
             continue
         x1, _, _, _ = box.xyxy[0].tolist()

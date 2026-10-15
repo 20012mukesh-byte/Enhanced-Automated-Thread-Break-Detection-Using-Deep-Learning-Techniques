@@ -4,16 +4,26 @@ from __future__ import annotations
 
 import argparse
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
+from ultralytics import YOLO
 
 from slot_number_ocr import (
+    SlotReading,
     TesseractNotFoundError,
+    associate_thread_to_slot,
     configure_tesseract,
     detect_slot_numbers,
     draw_slot_readings,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+THREAD_MODEL_PATH = PROJECT_ROOT / "models" / "yolo" / "thread_break.pt"
+THREAD_CONFIDENCE = 0.40
+IMAGE_SIZE = 640
 
 
 def find_number_regions(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
@@ -52,6 +62,26 @@ def find_number_regions(frame: np.ndarray) -> list[tuple[int, int, int, int]]:
     return [region for _, region in candidates[:5]]
 
 
+def read_slot_numbers(frame: np.ndarray) -> list[SlotReading]:
+    """OCR slot numbers from automatically located bright regions."""
+    readings = []
+    for roi in find_number_regions(frame):
+        readings.extend(detect_slot_numbers(frame, roi=roi))
+
+    unique_readings = []
+    for reading in readings:
+        center_x, center_y = reading.center
+        duplicate = any(
+            reading.text == existing.text
+            and abs(center_x - existing.center[0]) < 25
+            and abs(center_y - existing.center[1]) < 25
+            for existing in unique_readings
+        )
+        if not duplicate:
+            unique_readings.append(reading)
+    return unique_readings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0, help="webcam index (default: 0)")
@@ -66,12 +96,19 @@ def main() -> int:
     if args.ocr_interval <= 0:
         parser.error("--ocr-interval must be greater than zero")
 
-    try:
-        executable = configure_tesseract()
-    except TesseractNotFoundError as error:
-        print(str(error))
+    if not THREAD_MODEL_PATH.is_file():
+        print(f"Error: thread-break model not found: {THREAD_MODEL_PATH}")
         return 1
 
+    try:
+        thread_model = YOLO(str(THREAD_MODEL_PATH))
+        executable = configure_tesseract()
+    except Exception as error:
+        print(f"Error setting up detection: {error}")
+        return 1
+
+    print(f"Thread-break model loaded: {THREAD_MODEL_PATH}")
+    print(f"Thread classes: {thread_model.names}")
     print(f"Tesseract OCR ready: {executable}")
     camera = cv2.VideoCapture(args.camera)
     if not camera.isOpened():
@@ -83,6 +120,7 @@ def main() -> int:
     print("Webcam started. Press 'q' or Esc to quit.")
     slot_readings = []
     next_ocr_time = 0.0
+    previous_time = time.monotonic()
 
     try:
         while True:
@@ -91,48 +129,101 @@ def main() -> int:
                 print("Error: could not read a webcam frame.")
                 break
 
+            thread_result = thread_model.predict(
+                source=frame,
+                conf=THREAD_CONFIDENCE,
+                imgsz=IMAGE_SIZE,
+                verbose=False,
+            )[0]
+
             current_time = time.monotonic()
             if current_time >= next_ocr_time:
                 try:
-                    readings = []
-                    for roi in find_number_regions(frame):
-                        readings.extend(detect_slot_numbers(frame, roi=roi))
-                    slot_readings = readings
+                    slot_readings = read_slot_numbers(frame)
                 except TesseractNotFoundError as error:
                     print(str(error))
                     break
                 next_ocr_time = current_time + args.ocr_interval
 
-            display = frame.copy()
+            display = thread_result.plot()
+            thread_labels = []
+            thread_classes = set()
+            for box in thread_result.boxes:
+                class_name = str(thread_model.names[int(box.cls[0])]).lower()
+                thread_classes.add(class_name)
+                if class_name != "thread_break":
+                    continue
+
+                thread_box = tuple(float(value) for value in box.xyxy[0].tolist())
+                slot = associate_thread_to_slot(thread_box, slot_readings)
+                label = f"SLOT {slot.text}" if slot is not None else "SLOT UNKNOWN"
+                thread_labels.append(label)
+                x1, y1 = int(thread_box[0]), int(thread_box[1])
+                cv2.putText(
+                    display,
+                    label,
+                    (x1, max(20, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    (0, 255, 255) if slot is not None else (0, 165, 255),
+                    2,
+                )
+
             draw_slot_readings(display, slot_readings)
+
+            if "thread_break" in thread_classes:
+                thread_status = "THREAD BREAK DETECTED"
+                thread_color = (0, 0, 255)
+            elif "not_thread_break" in thread_classes:
+                thread_status = "THREAD NORMAL"
+                thread_color = (0, 255, 0)
+            else:
+                thread_status = "THREAD NOT DETECTED"
+                thread_color = (0, 165, 255)
+
+            if thread_labels:
+                thread_status += " - " + ", ".join(dict.fromkeys(thread_labels))
 
             if slot_readings:
                 numbers = ", ".join(reading.text for reading in slot_readings)
-                status = f"SLOT NUMBER DETECTED: {numbers}"
-                color = (0, 255, 0)
+                slot_status = f"SLOT NUMBERS: {numbers}"
+                slot_color = (0, 255, 0)
             else:
-                status = "SEARCHING FOR SLOT NUMBER..."
-                color = (0, 165, 255)
+                slot_status = "SLOT NUMBERS: SEARCHING..."
+                slot_color = (0, 165, 255)
+
+            elapsed = current_time - previous_time
+            fps = 1.0 / elapsed if elapsed > 0 else 0.0
+            previous_time = current_time
 
             cv2.putText(
                 display,
-                status,
+                thread_status,
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                color,
+                0.7,
+                thread_color,
                 2,
             )
             cv2.putText(
                 display,
-                "Automatic detection | Q/Esc: quit",
-                (20, 75),
+                slot_status,
+                (20, 72),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
+                0.65,
+                slot_color,
                 2,
             )
-            cv2.imshow("Slot Number Detection", display)
+            cv2.putText(
+                display,
+                f"FPS: {fps:.1f} | Q/Esc: quit",
+                (20, 104),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 0),
+                2,
+            )
+            cv2.imshow("Thread and Slot Detection", display)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
